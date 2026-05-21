@@ -1,0 +1,12 @@
+{
+  "categories": [
+    {"name": "Clothing", "types": ["Glove","Mits","Hat","Toque","Scarf","Shoes","T-Shirt","Shirt","Pants","Underwear","Jacket","Coat","Hoodie"]},
+    {"name": "Fire / Smoking", "types": ["Cigarette","Matches","Lighter"]},
+    {"name": "Food / Drink", "types": ["Food","Cup","Bottle","Water Canteen","Pots"]},
+    {"name": "Shelter / Camping", "types": ["Camp","Firecamp","Sleeping Bag","Camping Mattress"]},
+    {"name": "Traces / Signs", "types": ["Foot Step","Blood","Chopped Woods"]},
+    {"name": "Tools / Equipment", "types": ["Tools","Axe","Hatchet","Keys"]},
+    {"name": "Bags / Containers", "types": ["Bag","Backpack"]},
+    {"name": "Custom", "types": ["Other"]}
+  ]
+}
