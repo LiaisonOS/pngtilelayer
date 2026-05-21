@@ -68,6 +68,10 @@ public class PNGTileLayer extends Layer implements Runnable, ComponentListener {
     /** In-memory LRU tile cache keyed by "sourceName/z/x/y" */
     private final Map<String, BufferedImage> memoryCache;
 
+    /** Cached gray rendering of {@code current.img}, invalidated by reference change. */
+    private transient BufferedImage graySrc;
+    private transient BufferedImage grayOut;
+
     /**
      * Construct a PNGTileLayer.
      * Cache directory is read from the TileSourceManager config.
@@ -128,11 +132,17 @@ public class PNGTileLayer extends Layer implements Runnable, ComponentListener {
         if (current.isValid && current.img != null &&
                 current.isSameProjection(getProjection(), getWidth(), getHeight())) {
 
+            boolean grayscale = MapDisplaySettings.getInstance().isGrayscale();
+            BufferedImage toDraw = grayscale
+                    ? toGrayscale(current.img)
+                    : current.img;
+
             if (blockRegenerate) {
-                g.drawImage(current.img, offsetX, offsetY, this);
+                g.drawImage(toDraw, offsetX, offsetY, this);
             } else {
                 Point2D skew = current.getSkew(getProjection(), getSize());
-                g.drawImage(current.img, (int) skew.getX(), (int) skew.getY(), this);
+                g.drawImage(toDraw,
+                        (int) skew.getX(), (int) skew.getY(), this);
             }
 
             // Draw attribution
@@ -149,6 +159,32 @@ public class PNGTileLayer extends Layer implements Runnable, ComponentListener {
         } else if (!blockRegenerate && renderThread == null) {
             regenerate("current image not valid");
         }
+    }
+
+    /**
+     * Return a TYPE_BYTE_GRAY rendering of {@code src}. Cached by reference —
+     * the composite only changes when the projection/size changes, so we
+     * keep the gray buffer between paints. Reliable across JDK versions
+     * because the destination color model is byte-gray, not a quirky
+     * ColorConvertOp-derived ARGB.
+     */
+    private BufferedImage toGrayscale(BufferedImage src) {
+        if (src == graySrc && grayOut != null
+                && grayOut.getWidth() == src.getWidth()
+                && grayOut.getHeight() == src.getHeight()) {
+            return grayOut;
+        }
+        BufferedImage out = new BufferedImage(
+                src.getWidth(), src.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
+        Graphics2D gg = out.createGraphics();
+        try {
+            gg.drawImage(src, 0, 0, null);
+        } finally {
+            gg.dispose();
+        }
+        graySrc = src;
+        grayOut = out;
+        return out;
     }
 
     private void drawAttribution(Graphics g, String text) {
@@ -457,6 +493,17 @@ public class PNGTileLayer extends Layer implements Runnable, ComponentListener {
                     ": " + e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * Snap the map to a fixed 1:N cartographic scale. The float is the
+     * denominator (e.g. {@code 5000f} → 1:5,000). Forwarded directly to
+     * the OpenMap MapBean.
+     */
+    public void setMapScale(float scale) {
+        if (mapBean != null && scale > 0f) {
+            mapBean.setScale(scale);
+        }
     }
 
     // ==========================================

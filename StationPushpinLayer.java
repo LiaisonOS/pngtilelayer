@@ -37,8 +37,10 @@ import java.awt.geom.Point2D;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TimeZone;
 
@@ -136,6 +138,46 @@ public class StationPushpinLayer extends Layer
 
     /** Stations hidden via the visibility dialog */
     private final Set<String> hiddenStations = new HashSet<>();
+
+    /**
+     * High-water mark per callsign for incremental PointStore sync — only
+     * positions strictly newer than the stored timestamp are INSERTed during
+     * paint. Without this guard, every paint cycle replayed YAAC's full
+     * message history into SQLite on the EDT, starving sibling layers
+     * (notably the PNGTileLayer below us) of repaint time.
+     */
+    private final Map<String, Long> lastSyncedTime = new HashMap<>();
+
+    /**
+     * Operator's own callsign read from {@code ~/.config/liaisonos/user.json}.
+     * Re-read at the start of each paint so a Dashboard change is picked up
+     * without restarting YAAC. We deliberately exclude this from PointStore
+     * persistence — the home station is always live in YAAC's tracker so
+     * persisting it wastes DB space, and if the operator renames their
+     * callsign mid-session, stale rows under the old name would surface as
+     * phantom pushpins on the next replay.
+     */
+    private String homeCallsign;
+
+    private static String readHomeCallsign() {
+        java.io.File f = new java.io.File(System.getProperty("user.home"),
+                ".config/liaisonos/user.json");
+        if (!f.exists()) return null;
+        try {
+            String content = new String(
+                    java.nio.file.Files.readAllBytes(f.toPath()));
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"callsign\"\\s*:\\s*\"([^\"]*)\"")
+                    .matcher(content);
+            if (m.find()) {
+                String cs = m.group(1).trim().toUpperCase();
+                if (!cs.isEmpty() && !cs.equals("N0CALL")) return cs;
+            }
+        } catch (Exception e) {
+            // silent — fall back to no filter
+        }
+        return null;
+    }
 
     /** Screen-space points from last paint, for click hit-testing */
     private final List<RenderedPoint> renderedPoints = new ArrayList<>();
@@ -347,6 +389,10 @@ public class StationPushpinLayer extends Layer
         Projection proj = getProjection();
         if (proj == null) return;
 
+        // Refresh home callsign (cheap file read) so a Dashboard change picks up
+        // immediately. Used to skip persisting our own beacons to PointStore.
+        homeCallsign = readHomeCallsign();
+
         Graphics2D g2 = (Graphics2D) g;
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                 RenderingHints.VALUE_ANTIALIAS_ON);
@@ -355,6 +401,12 @@ public class StationPushpinLayer extends Layer
 
         int viewWidth = mapBean.getWidth();
         int viewHeight = mapBean.getHeight();
+
+        // Grid overlay paints first so it sits under everything we draw below.
+        if (MapDisplaySettings.getInstance().isShowGrid()) {
+            UtmGridRenderer.paint(g2, proj, viewWidth, viewHeight,
+                    MapDisplaySettings.getInstance().getGridSpacingMeters());
+        }
 
         renderedPoints.clear();
 
@@ -429,6 +481,82 @@ public class StationPushpinLayer extends Layer
             }
         }
 
+        // Render stations that exist ONLY in PointStore (not in YAAC's in-memory
+        // tracker yet). Happens after restart/crash when persisted history is
+        // ahead of the live APRS feed.
+        long savedMaxAge = DEFAULT_TRAIL_AGE_MS;
+        if (guiIfc instanceof GeographicalMap) {
+            savedMaxAge = ((GeographicalMap) guiIfc).getMaxTrackDuration();
+        }
+        long cutoff = System.currentTimeMillis() - savedMaxAge;
+        PointStore store = PointStore.getInstance();
+        if (store != null) {
+            // Build a set of callsigns we already drew via the live path so
+            // we don't render duplicates.
+            java.util.Set<String> liveCallsigns = new java.util.HashSet<>();
+            for (StationState ss : stations) {
+                if (ss != null) liveCallsigns.add(ss.getIdentifier());
+            }
+            for (String savedCs : store.getActiveCallsigns(cutoff)) {
+                if (liveCallsigns.contains(savedCs)) continue;
+                if (hiddenStations.contains(savedCs.toUpperCase().trim())) continue;
+                // Don't restore phantom rows under the operator's old callsign.
+                if (homeCallsign != null && homeCallsign.equalsIgnoreCase(savedCs)) continue;
+
+                List<double[]> trail = store.getStationPositions(savedCs, cutoff);
+                if (trail.isEmpty()) continue;
+
+                // Apply min-distance filter for visual clarity (same rule as
+                // live trails).
+                int minDistMeters = StationColorManager.DEFAULT_MIN_DISTANCE;
+                if (colorManager != null) {
+                    minDistMeters = colorManager.getMinDistance(savedCs);
+                }
+                if (minDistMeters > 0 && trail.size() > 1) {
+                    List<double[]> filtered = new ArrayList<>();
+                    filtered.add(trail.get(0));
+                    for (int j = 1; j < trail.size(); j++) {
+                        double[] prev = filtered.get(filtered.size() - 1);
+                        double[] cur = trail.get(j);
+                        if (haversineMeters(prev[0], prev[1], cur[0], cur[1])
+                                >= minDistMeters) {
+                            filtered.add(cur);
+                        }
+                    }
+                    trail = filtered;
+                }
+
+                double[] last = trail.get(trail.size() - 1);
+                Point2D p = proj.forward(last[0], last[1]);
+                float px = (float) p.getX();
+                float py = (float) p.getY();
+                if (!(px >= -50 && px <= viewWidth + 50
+                        && py >= -50 && py <= viewHeight + 50)) {
+                    continue;
+                }
+
+                Color savedColor = colorManager != null
+                        ? colorManager.getColor(savedCs)
+                        : PUSHPIN_COLOR;
+                // Faded a touch so operators can distinguish saved-only from
+                // currently-tracked stations at a glance.
+                Color fadedColor = new Color(savedColor.getRed(),
+                        savedColor.getGreen(), savedColor.getBlue(), 180);
+
+                int trailCount = colorManager != null
+                        ? colorManager.getTrailCount(savedCs)
+                        : MAX_TRAIL_POINTS;
+                if (trail.size() > 1 && trailCount > 0) {
+                    renderTrail(g2, proj, trail, viewWidth, viewHeight,
+                            fadedColor, savedCs, trailCount);
+                }
+                renderPushpin(g2, px, py, savedCs, fadedColor);
+                renderedPoints.add(new RenderedPoint(
+                        px, py, savedCs, last[0], last[1],
+                        (long) last[2], false, Double.NaN, Double.NaN, false));
+            }
+        }
+
         // Draw SAR object markers
         if (sarManager != null) {
             for (SARObject sarObj : sarManager.getObjects()) {
@@ -499,7 +627,6 @@ public class StationPushpinLayer extends Layer
      * visual clutter (star patterns from stationary stations).
      */
     private List<double[]> buildTrail(StationState ss) {
-        List<double[]> trail = new ArrayList<>();
         long maxAge = DEFAULT_TRAIL_AGE_MS;
         if (guiIfc instanceof GeographicalMap) {
             maxAge = ((GeographicalMap) guiIfc).getMaxTrackDuration();
@@ -507,50 +634,100 @@ public class StationPushpinLayer extends Layer
         long cutoff = System.currentTimeMillis() - maxAge;
         String ident = ss.getIdentifier();
 
-        // Get per-station min distance (or global default)
         int minDistMeters = StationColorManager.DEFAULT_MIN_DISTANCE;
         if (colorManager != null) {
             minDistMeters = colorManager.getMinDistance(ident);
         }
 
-        double lastLat = Double.NaN;
-        double lastLon = Double.NaN;
+        PointStore store = PointStore.getInstance();
 
-        for (int i = 1; i < ss.size(); i++) {
-            AX25Message msg = ss.get(i);
-            if (msg == null) continue;
-            if (msg.rcptTime < cutoff) continue;
+        // ─── Phase 1: incrementally persist any positions newer than what
+        // we've already synced for this station. The naive approach of
+        // re-syncing every message on every paint stalled the EDT (the SQL
+        // round-trip per row, multiplied by every position in YAAC's history,
+        // multiplied by every paint cycle) and starved sibling layers like
+        // PNGTileLayer of repaint time. We now keep an in-memory high-water
+        // mark per callsign and only INSERT rows we haven't seen yet.
+        // Skip persistence entirely for the operator's own callsign — it's
+        // always live in YAAC's tracker so DB rows would only ever be dead
+        // weight, and renaming the callsign in the Dashboard would leave
+        // stale rows under the previous name.
+        boolean isHome = homeCallsign != null && homeCallsign.equalsIgnoreCase(ident);
 
-            if (msg instanceof PositionMessage) {
-                if (msg instanceof ObjectReport) {
-                    String objName = ((ObjectReport) msg).objectName;
-                    if (objName != null && !objName.equals(ident)) {
-                        continue;
+        if (store != null && !isHome) {
+            long lastSynced = lastSyncedTime.getOrDefault(ident, 0L);
+            long newWatermark = lastSynced;
+
+            // Pass 1: historical PositionMessages from YAAC's message history.
+            for (int i = 1; i < ss.size(); i++) {
+                AX25Message msg = ss.get(i);
+                if (msg == null) continue;
+                if (msg.rcptTime < cutoff) continue;
+                if (msg.rcptTime <= lastSynced) continue;    // already synced
+                if (msg instanceof PositionMessage) {
+                    if (msg instanceof ObjectReport) {
+                        String objName = ((ObjectReport) msg).objectName;
+                        if (objName != null && !objName.equals(ident)) continue;
                     }
+                    PositionMessage pm = (PositionMessage) msg;
+                    double lat = pm.decodeLatitude();
+                    double lon = pm.decodeLongitude();
+                    if (lat == 0.0 && lon == 0.0) continue;
+                    store.addStationPosition(ident, lat, lon, msg.rcptTime,
+                            null, null, null, null, null);
+                    if (msg.rcptTime > newWatermark) newWatermark = msg.rcptTime;
                 }
-                PositionMessage pm = (PositionMessage) msg;
-                double lat = pm.decodeLatitude();
-                double lon = pm.decodeLongitude();
-                if (lat == 0.0 && lon == 0.0) continue;
+            }
 
-                // Skip if too close to previous accepted point
-                if (!Double.isNaN(lastLat) && minDistMeters > 0) {
-                    double dist = haversineMeters(lastLat, lastLon, lat, lon);
-                    if (dist < minDistMeters) {
-                        continue;
-                    }
+            // Pass 2: current live position. For freshly-tracked stations the
+            // current ss.getLatitude/Longitude isn't yet in the message-history
+            // loop above — without this insert, a station that sent exactly one
+            // beacon never reaches SQLite. The (callsign, timestamp) UNIQUE
+            // constraint keeps repeat inserts cheap.
+            long curTime = ss.getLastPosTime();
+            if (curTime > 0 && curTime >= cutoff && curTime > lastSynced) {
+                double curLat = ss.getLatitude();
+                double curLon = ss.getLongitude();
+                if (curLat != 0.0 || curLon != 0.0) {
+                    store.addStationPosition(ident, curLat, curLon, curTime,
+                            null, null, null, null, null);
+                    if (curTime > newWatermark) newWatermark = curTime;
                 }
+            }
 
-                trail.add(new double[]{lat, lon, (double) msg.rcptTime});
-                lastLat = lat;
-                lastLon = lon;
+            if (newWatermark > lastSynced) {
+                lastSyncedTime.put(ident, newWatermark);
             }
         }
 
-        // Sort historical points by timestamp (oldest first)
-        trail.sort((a, b) -> Double.compare(a[2], b[2]));
+        // ─── Phase 2: source the trail from SQLite (canonical) when
+        // available, else fall back to the live in-memory history.
+        List<double[]> trail;
+        if (store != null) {
+            trail = store.getStationPositions(ident, cutoff);
+        } else {
+            trail = new ArrayList<>();
+            for (int i = 1; i < ss.size(); i++) {
+                AX25Message msg = ss.get(i);
+                if (msg == null) continue;
+                if (msg.rcptTime < cutoff) continue;
+                if (msg instanceof PositionMessage) {
+                    if (msg instanceof ObjectReport) {
+                        String objName = ((ObjectReport) msg).objectName;
+                        if (objName != null && !objName.equals(ident)) continue;
+                    }
+                    PositionMessage pm = (PositionMessage) msg;
+                    double lat = pm.decodeLatitude();
+                    double lon = pm.decodeLongitude();
+                    if (lat == 0.0 && lon == 0.0) continue;
+                    trail.add(new double[]{lat, lon, (double) msg.rcptTime});
+                }
+            }
+            trail.sort((a, b) -> Double.compare(a[2], b[2]));
+        }
 
-        // Re-apply min distance filter after sorting
+        // ─── Phase 3: visual min-distance filter (drops zigzag clutter
+        // from stationary stations that report every minute).
         if (minDistMeters > 0 && trail.size() > 1) {
             List<double[]> filtered = new ArrayList<>();
             filtered.add(trail.get(0));
@@ -564,7 +741,7 @@ public class StationPushpinLayer extends Layer
             trail = filtered;
         }
 
-        // Current position as last entry (rcptTime=max sentinel)
+        // ─── Phase 4: current position as sentinel.
         trail.add(new double[]{ss.getLatitude(), ss.getLongitude(),
                 (double) Long.MAX_VALUE});
         return trail;
@@ -584,6 +761,22 @@ public class StationPushpinLayer extends Layer
         Stroke origStroke = g2.getStroke();
         int segCount = trail.size() - 1;
 
+        // Global track style — read once per trail render
+        TrackSettings ts = TrackSettings.getInstance();
+        TrackSettings.Shape       shape    = ts.getShape();
+        TrackSettings.MarkerSize  szPref   = ts.getMarkerSize();
+        TrackSettings.LineStyle   linePref = ts.getLineStyle();
+        TrackSettings.Coverage    covPref  = ts.getCoverage();
+
+        float baseSize = (szPref == TrackSettings.MarkerSize.SMALL)
+                ? CRUMB_SIZE * 0.7f
+                : (float) CRUMB_SIZE;
+
+        // Coverage clamp: Last-3 caps visible line segments at 3.
+        int effectiveMax = (covPref == TrackSettings.Coverage.LAST_3)
+                ? Math.min(maxSegments, 3)
+                : maxSegments;
+
         float[] sx = new float[trail.size()];
         float[] sy = new float[trail.size()];
         for (int i = 0; i < trail.size(); i++) {
@@ -597,8 +790,8 @@ public class StationPushpinLayer extends Layer
         Color crumbColor = new Color(pinColor.getRed(), pinColor.getGreen(),
                 pinColor.getBlue(), baseAlpha);
 
-        // Draw lines only for the last maxSegments segments (graduated styling)
-        int lineStart = Math.max(0, segCount - maxSegments);
+        // Draw lines only for the last effectiveMax segments (graduated styling)
+        int lineStart = Math.max(0, segCount - effectiveMax);
         for (int i = lineStart; i < segCount; i++) {
             int ageFromNewest = segCount - 1 - i;
             int visibleCount = segCount - lineStart;
@@ -607,11 +800,14 @@ public class StationPushpinLayer extends Layer
             Stroke lineStroke;
             if (ageFromNewest == 0) {
                 alpha = 1.0f;
+                // Newest segment: always solid (anchors the eye to "now")
                 lineStroke = TRAIL_STROKE;
             } else {
                 // Graduated: newest=1.0, oldest=0.35, linear fade between
                 alpha = 1.0f - 0.65f * ((float) ageFromNewest / Math.max(1, visibleCount - 1));
-                lineStroke = TRAIL_STROKE_DASHED;
+                lineStroke = (linePref == TrackSettings.LineStyle.SOLID)
+                        ? TRAIL_STROKE
+                        : TRAIL_STROKE_DASHED;
             }
 
             Color trailColor = new Color(pinColor.getRed(), pinColor.getGreen(),
@@ -623,19 +819,20 @@ public class StationPushpinLayer extends Layer
                         (int) sx[i + 1], (int) sy[i + 1]);
         }
 
-        // Draw triangles at ALL historical positions
+        // Draw markers at ALL historical positions
         for (int i = 0; i < segCount; i++) {
             if (sx[i] >= -50 && sx[i] <= viewWidth + 50 &&
                 sy[i] >= -50 && sy[i] <= viewHeight + 50) {
 
-                // Compute triangle directly from screen direction — no rotation
+                // Direction toward next point (used for triangle orientation)
                 float dx = sx[i + 1] - sx[i];
                 float dy = sy[i + 1] - sy[i];
                 float len = (float) Math.sqrt(dx * dx + dy * dy);
                 if (len >= 1f) {
                     float nx = dx / len;
                     float ny = dy / len;
-                    renderBreadcrumb(g2, sx[i], sy[i], nx, ny, crumbColor);
+                    renderBreadcrumb(g2, sx[i], sy[i], nx, ny, crumbColor,
+                            shape, baseSize);
                 }
 
                 double[] pt = trail.get(i);
@@ -655,17 +852,32 @@ public class StationPushpinLayer extends Layer
     }
 
     /**
-     * Render a breadcrumb arrowhead — tip at (px,py) pointing
-     * toward (nx,ny) direction. Narrow base, longer sides (not isoceles).
+     * Render a breadcrumb marker — tip/center at (px,py). Shape and size are
+     * taken from global TrackSettings. Triangles point toward (nx,ny);
+     * circles ignore direction.
      */
     private void renderBreadcrumb(Graphics2D g2, float px, float py,
-                                   float nx, float ny, Color crumbColor) {
-        // Perpendicular to direction
+                                   float nx, float ny, Color crumbColor,
+                                   TrackSettings.Shape shape, float baseSize) {
+        g2.setColor(crumbColor);
+
+        if (shape == TrackSettings.Shape.CIRCLE) {
+            // Circles render smaller than triangles — no narrow tip means
+            // they read as bulkier at the same base size. Large circle ≈
+            // small triangle; small circle is another 30% smaller.
+            float circleBase = baseSize * 0.7f;
+            float radius = circleBase * 1.1f;
+            int d = Math.round(radius * 2f);
+            g2.fillOval(Math.round(px - radius), Math.round(py - radius), d, d);
+            return;
+        }
+
+        // Triangle (default) — perpendicular to direction
         float perpX = -ny;
         float perpY = nx;
 
-        float h = CRUMB_SIZE * 2.2f;  // long sides (height)
-        float w = CRUMB_SIZE * 0.7f;  // base (half-width)
+        float h = baseSize * 2.2f;  // long sides (height)
+        float w = baseSize * 0.7f;  // base (half-width)
 
         // Tip at trail point, body extends BEHIND (opposite to direction)
         int[] triX = {
@@ -679,7 +891,6 @@ public class StationPushpinLayer extends Layer
             (int) (py - ny * h - perpY * w)              // base right
         };
 
-        g2.setColor(crumbColor);
         g2.fillPolygon(triX, triY, 3);
     }
 
@@ -764,10 +975,22 @@ public class StationPushpinLayer extends Layer
         panel.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
         panel.setBackground(Color.WHITE);
 
-        JLabel callLabel = new JLabel(rp.callsign);
+        // Header: "FirstName - CALLSIGN" when we can resolve the operator,
+        // otherwise just the callsign. Name comes from the LiaisonOS license
+        // DB (same data used by et-logger / et-predict).
+        String operatorName = CallsignDatabase.lookupName(rp.callsign);
+        String header = rp.callsign;
+        if (operatorName != null && !operatorName.isEmpty()) {
+            String firstName = operatorName.trim().split("\\s+", 2)[0];
+            if (!firstName.isEmpty()) {
+                header = firstName + " - " + rp.callsign;
+            }
+        }
+        JLabel callLabel = new JLabel(header);
         callLabel.setFont(new Font("SansSerif", Font.BOLD, 13));
         callLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         panel.add(callLabel);
+
         panel.add(Box.createVerticalStrut(4));
 
         if (rp.rcptTime > 0) {

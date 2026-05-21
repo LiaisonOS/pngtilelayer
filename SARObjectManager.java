@@ -15,7 +15,11 @@ import java.util.Map;
 
 /**
  * Manages SAR evidence objects placed on the map.
- * Persists to ~/.yaac/sar-objects.json.
+ * <p>
+ * Persists to {@link PointStore} (SQLite at
+ * {@code ~/.config/liaisonos/YAAC/ptl-data.db}). On first launch, any legacy
+ * {@code ~/.yaac/sar-objects.json} is imported once and renamed
+ * {@code sar-objects.json.imported}.
  */
 public class SARObjectManager {
 
@@ -52,17 +56,26 @@ public class SARObjectManager {
 
     public void addObject(SARObject obj) {
         objects.add(obj);
-        saveObjects();
+        PointStore store = PointStore.getInstance();
+        if (store != null) store.addSarObject(obj);
     }
 
     public void removeObject(String id) {
         for (int i = 0; i < objects.size(); i++) {
             if (objects.get(i).getId().equals(id)) {
                 objects.remove(i);
-                saveObjects();
+                PointStore store = PointStore.getInstance();
+                if (store != null) store.removeSarObject(id);
                 return;
             }
         }
+    }
+
+    /** Remove every SAR object, both in memory and in the persistent store. */
+    public void clearAll() {
+        objects.clear();
+        PointStore store = PointStore.getInstance();
+        if (store != null) store.removeAllSarObjects();
     }
 
     public List<SARObject> getObjects() {
@@ -78,43 +91,63 @@ public class SARObjectManager {
     }
 
     /**
-     * Load objects from ~/.yaac/sar-objects.json.
+     * Load SAR objects. Primary source is the SQLite {@link PointStore}.
+     * On first run, also imports a legacy {@code ~/.yaac/sar-objects.json}
+     * if present (one-shot migration) and renames it
+     * {@code sar-objects.json.imported} so it doesn't import again.
      */
     public void loadObjects(String yaacConfigDir) {
         this.configPath = yaacConfigDir + File.separator + CONFIG_FILE;
-        File configFile = new File(configPath);
+        objects.clear();
 
-        if (!configFile.exists()) return;
+        // Primary load: SQLite
+        PointStore store = PointStore.getInstance();
+        if (store != null) {
+            objects.addAll(store.getAllSarObjects());
+        }
 
-        try {
-            String json = readFile(configFile);
-            parseJson(json);
-        } catch (Exception e) {
-            System.err.println("SARObjectManager: error loading " +
-                    configPath + ": " + e.getMessage());
+        // One-shot legacy JSON import — only if the file still exists.
+        File legacyFile = new File(configPath);
+        if (legacyFile.exists()) {
+            try {
+                String json = readFile(legacyFile);
+                List<SARObject> before = new ArrayList<>(objects);
+                parseJson(json);
+                // parseJson() replaces in-memory list with JSON contents.
+                // Merge anything that came from SQL but wasn't in JSON.
+                for (SARObject sqlObj : before) {
+                    boolean found = false;
+                    for (SARObject jsonObj : objects) {
+                        if (sqlObj.getId().equals(jsonObj.getId())) { found = true; break; }
+                    }
+                    if (!found) objects.add(sqlObj);
+                }
+                // Now mirror everything to SQLite (idempotent inserts)
+                if (store != null) {
+                    for (SARObject obj : objects) store.addSarObject(obj);
+                }
+                // Rename the legacy file so we don't import it again
+                File renamed = new File(configPath + ".imported");
+                if (!legacyFile.renameTo(renamed)) {
+                    System.err.println("SARObjectManager: could not rename legacy "
+                            + "JSON; will re-import next launch");
+                }
+            } catch (Exception e) {
+                System.err.println("SARObjectManager: legacy import error: "
+                        + e.getMessage());
+            }
         }
     }
 
     /**
-     * Save current objects to JSON config file.
+     * @deprecated SAR objects now persist via {@link PointStore}; this method
+     *             is a no-op kept for source compatibility. Will be removed
+     *             once all callers are migrated.
      */
+    @Deprecated
     public void saveObjects() {
-        if (configPath == null) return;
-
-        try {
-            File configFile = new File(configPath);
-            File parentDir = configFile.getParentFile();
-            if (parentDir != null && !parentDir.exists()) {
-                parentDir.mkdirs();
-            }
-
-            String json = toJson();
-            BufferedWriter writer = new BufferedWriter(new FileWriter(configFile));
-            writer.write(json);
-            writer.close();
-        } catch (IOException e) {
-            System.err.println("SARObjectManager: error saving: " + e.getMessage());
-        }
+        // intentionally empty — persistence happens per-call in
+        // addObject() / removeObject() / clearAll() via PointStore.
     }
 
     // --- JSON serialization ---
