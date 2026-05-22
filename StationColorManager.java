@@ -123,6 +123,20 @@ public class StationColorManager {
     }
 
     /**
+     * Largest phase-out (in minutes) across every configured station, or
+     * {@link #DEFAULT_PHASE_OUT} if no overrides exist. Used as the global
+     * enumeration cutoff when restoring saved stations from the point
+     * store — the wider this is, the further back we'll search.
+     */
+    public int getMaxPhaseOut() {
+        int max = DEFAULT_PHASE_OUT;
+        for (Integer p : stationPhaseOut.values()) {
+            if (p != null && p > max) max = p;
+        }
+        return max;
+    }
+
+    /**
      * Get the opacity (0-255) for a callsign, or the default if unset.
      */
     public int getOpacity(String callsign) {

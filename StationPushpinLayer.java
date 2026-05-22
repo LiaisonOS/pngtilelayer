@@ -442,7 +442,11 @@ public class StationPushpinLayer extends Layer
 
             List<double[]> trail = buildTrail(ss);
 
-            // Phase-out check: find most recent point time
+            // Phase-out = max age before the station disappears. The newest
+            // point in the trail determines elapsed time; if it's older than
+            // phase-out, skip rendering this station entirely. The last
+            // quarter of the window we grey the pushpin as a "going stale"
+            // visual cue so operators get a warning before it vanishes.
             int phaseOutMin = colorManager != null
                     ? colorManager.getPhaseOut(ss.getIdentifier())
                     : StationColorManager.DEFAULT_PHASE_OUT;
@@ -452,9 +456,15 @@ public class StationPushpinLayer extends Layer
                     long t = (long) pt[2];
                     if (t > lastPointTime) lastPointTime = t;
                 }
+                long curTime = ss.getLastPosTime();
+                if (curTime > lastPointTime) lastPointTime = curTime;
                 if (lastPointTime > 0) {
                     long elapsed = System.currentTimeMillis() - lastPointTime;
-                    if (elapsed > phaseOutMin * 60000L) {
+                    long phaseOutMs = phaseOutMin * 60000L;
+                    if (elapsed > phaseOutMs) {
+                        continue; // station too old — hide entirely
+                    }
+                    if (elapsed > (phaseOutMs * 3) / 4) {
                         stationColor = PHASED_OUT_COLOR;
                     }
                 }
@@ -483,12 +493,13 @@ public class StationPushpinLayer extends Layer
 
         // Render stations that exist ONLY in PointStore (not in YAAC's in-memory
         // tracker yet). Happens after restart/crash when persisted history is
-        // ahead of the live APRS feed.
-        long savedMaxAge = DEFAULT_TRAIL_AGE_MS;
-        if (guiIfc instanceof GeographicalMap) {
-            savedMaxAge = ((GeographicalMap) guiIfc).getMaxTrackDuration();
-        }
-        long cutoff = System.currentTimeMillis() - savedMaxAge;
+        // ahead of the live APRS feed. Visibility is driven by per-station
+        // phase-out (in minutes) — same lever the user sets in Station Settings.
+        int globalMaxPhaseOut = colorManager != null
+                ? colorManager.getMaxPhaseOut()
+                : StationColorManager.DEFAULT_PHASE_OUT;
+        long enumerationCutoff = System.currentTimeMillis()
+                - (globalMaxPhaseOut * 60000L);
         PointStore store = PointStore.getInstance();
         if (store != null) {
             // Build a set of callsigns we already drew via the live path so
@@ -497,13 +508,21 @@ public class StationPushpinLayer extends Layer
             for (StationState ss : stations) {
                 if (ss != null) liveCallsigns.add(ss.getIdentifier());
             }
-            for (String savedCs : store.getActiveCallsigns(cutoff)) {
+            for (String savedCs : store.getActiveCallsigns(enumerationCutoff)) {
                 if (liveCallsigns.contains(savedCs)) continue;
                 if (hiddenStations.contains(savedCs.toUpperCase().trim())) continue;
                 // Don't restore phantom rows under the operator's old callsign.
                 if (homeCallsign != null && homeCallsign.equalsIgnoreCase(savedCs)) continue;
 
-                List<double[]> trail = store.getStationPositions(savedCs, cutoff);
+                // Per-station phase-out: tighter than the global enumeration
+                // window. Skip rows older than this specific station's setting.
+                int stationPhaseOut = colorManager != null
+                        ? colorManager.getPhaseOut(savedCs)
+                        : StationColorManager.DEFAULT_PHASE_OUT;
+                long stationCutoff = System.currentTimeMillis()
+                        - (stationPhaseOut * 60000L);
+
+                List<double[]> trail = store.getStationPositions(savedCs, stationCutoff);
                 if (trail.isEmpty()) continue;
 
                 // Apply min-distance filter for visual clarity (same rule as
@@ -627,12 +646,19 @@ public class StationPushpinLayer extends Layer
      * visual clutter (star patterns from stationary stations).
      */
     private List<double[]> buildTrail(StationState ss) {
-        long maxAge = DEFAULT_TRAIL_AGE_MS;
-        if (guiIfc instanceof GeographicalMap) {
-            maxAge = ((GeographicalMap) guiIfc).getMaxTrackDuration();
-        }
-        long cutoff = System.currentTimeMillis() - maxAge;
         String ident = ss.getIdentifier();
+
+        // Trail age cutoff follows the station's phase-out setting so the
+        // operator has one lever for "how long to keep things visible".
+        // YAAC's own getMaxTrackDuration() is no longer consulted — it was
+        // a hidden constraint that capped at 24h regardless of plugin config.
+        int phaseOutMin = colorManager != null
+                ? colorManager.getPhaseOut(ident)
+                : StationColorManager.DEFAULT_PHASE_OUT;
+        long maxAgeMs = (phaseOutMin > 0)
+                ? phaseOutMin * 60000L
+                : DEFAULT_TRAIL_AGE_MS;
+        long cutoff = System.currentTimeMillis() - maxAgeMs;
 
         int minDistMeters = StationColorManager.DEFAULT_MIN_DISTANCE;
         if (colorManager != null) {
