@@ -94,6 +94,14 @@ public class MapSourceManagerDialog extends JDialog implements ActionListener {
         refreshCacheButton.addActionListener(this);
         buttonPanel.add(refreshCacheButton);
 
+        JButton patchViewButton = new JButton("Patch Missing in View");
+        patchViewButton.setActionCommand("patchMissing");
+        patchViewButton.addActionListener(this);
+        patchViewButton.setToolTipText(
+                "Download just the missing tiles in the current map view " +
+                "(useful before going offline)");
+        buttonPanel.add(patchViewButton);
+
         // Layer toggle checkboxes
         JPanel checkboxPanel = new JPanel();
         checkboxPanel.setLayout(new BoxLayout(checkboxPanel, BoxLayout.Y_AXIS));
@@ -154,6 +162,9 @@ public class MapSourceManagerDialog extends JDialog implements ActionListener {
                 break;
             case "refreshCache":
                 refreshCache();
+                break;
+            case "patchMissing":
+                patchMissingInView();
                 break;
         }
     }
@@ -313,6 +324,51 @@ public class MapSourceManagerDialog extends JDialog implements ActionListener {
         JOptionPane.showMessageDialog(this, "Cache refreshed for " + source.getName() +
                 "\nVisible tiles are being re-downloaded.",
                 "Refresh Cache", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    /**
+     * Download just the tiles in the current viewport that aren't already
+     * cached. Doesn't delete anything. Useful right before going offline.
+     */
+    private void patchMissingInView() {
+        if (tileLayer == null) return;
+
+        int row = sourceTable.getSelectedRow();
+        TileSource source;
+        if (row >= 0) {
+            source = tableModel.getSourceAt(row);
+        } else {
+            source = sourceManager.getActiveSource();
+        }
+        if (source == null) {
+            JOptionPane.showMessageDialog(this, "No tile source selected.",
+                    "Patch Missing", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        if (!source.hasCache()) {
+            JOptionPane.showMessageDialog(this,
+                    "Source \"" + source.getName() + "\" has no cache file.",
+                    "Patch Missing", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        int queued = tileLayer.patchMissingTilesInView(source);
+        if (queued == 0) {
+            JOptionPane.showMessageDialog(this,
+                    "No missing tiles — the current view AND its " +
+                    "surrounding buffer are fully cached for \""
+                    + source.getName() + "\".",
+                    "Patch Missing", JOptionPane.INFORMATION_MESSAGE);
+        } else {
+            JOptionPane.showMessageDialog(this,
+                    "Downloading " + queued + " missing tile" +
+                    (queued == 1 ? "" : "s") + " for \"" + source.getName() +
+                    "\".\n\nCovers the current view PLUS a one-view-wide " +
+                    "buffer on each side (≈ 3× area).\n" +
+                    "Tiles will fill in on the map as they arrive; the buffer\n" +
+                    "tiles cache silently for when you pan there.",
+                    "Patch Missing", JOptionPane.INFORMATION_MESSAGE);
+        }
     }
 
     private void saveAndRefresh() {

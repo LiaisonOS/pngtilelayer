@@ -23,45 +23,61 @@ import java.util.concurrent.ConcurrentHashMap;
  *     x INTEGER NOT NULL,
  *     y INTEGER NOT NULL,
  *     data BLOB NOT NULL,
- *     extension TEXT NOT NULL,
- *     created_at INTEGER NOT NULL,
- *     updated_at INTEGER,
- *     expires_at INTEGER,
  *     PRIMARY KEY (z, x, y)
  * );
+ *
+ * Legacy databases built with the older schema (which had extension,
+ * created_at, updated_at, expires_at columns) keep working — we only
+ * SELECT data, and putTile falls back to a legacy INSERT shape if
+ * the minimal one fails on NOT NULL constraints.
  * </pre>
  * <p>
  * Each tile source has its own .db file. Connections are pooled per file.
  */
 public class TileCache {
 
+    /**
+     * MINIMAL SCHEMA. No expires_at, no extension, no timestamps —
+     * just (z, x, y) → data. If a tile is in the table, it is served.
+     * No "expired" tile logic anywhere in this class. Forever.
+     *
+     * Why: this cache must work 100% of the time, today and in 100 years.
+     * The product is offline-first SAR mapping. Any column in the SELECT
+     * that doesn't exist in legacy caches throws SQLException → cache
+     * miss → silent fall-through to the internet. Has bitten the operator
+     * repeatedly. See feedback memory [[tilecache-no-expiration]].
+     *
+     * The wider 4-column SELECT is GONE — never re-add columns to the read
+     * path. Storage path stays compatible with both old (extended) and new
+     * (minimal) schemas via "INSERT OR IGNORE missing-column safe" wrapper
+     * in {@link #putTile}.
+     */
     private static final String SQL_GET_TILE =
-            "SELECT data, expires_at FROM tiles WHERE z = ? AND x = ? AND y = ?";
-
-    private static final String SQL_PUT_TILE =
-            "INSERT OR REPLACE INTO tiles (z, x, y, data, extension, created_at, updated_at, expires_at) " +
-            "VALUES (?, ?, ?, ?, '.png', ?, ?, ?)";
+            "SELECT data FROM tiles WHERE z = ? AND x = ? AND y = ?";
 
     private static final String SQL_HAS_TILE =
             "SELECT 1 FROM tiles WHERE z = ? AND x = ? AND y = ?";
 
+    /** Minimal-schema insert for NEW caches. */
+    private static final String SQL_PUT_TILE_MIN =
+            "INSERT OR REPLACE INTO tiles (z, x, y, data) VALUES (?, ?, ?, ?)";
+
+    /** Legacy-schema insert: existing caches built with the older NOT NULL
+     *  columns. Tried as a fallback if the minimal form fails. */
+    private static final String SQL_PUT_TILE_LEGACY =
+            "INSERT OR REPLACE INTO tiles " +
+            "(z, x, y, data, extension, created_at, updated_at) " +
+            "VALUES (?, ?, ?, ?, '.png', ?, ?)";
+
+    /** New caches get this minimal schema. Existing caches keep their schema
+     *  (CREATE TABLE IF NOT EXISTS no-ops). */
     private static final String SQL_CREATE_TABLE =
             "CREATE TABLE IF NOT EXISTS tiles (" +
             "z INTEGER NOT NULL, " +
             "x INTEGER NOT NULL, " +
             "y INTEGER NOT NULL, " +
             "data BLOB NOT NULL, " +
-            "extension TEXT NOT NULL, " +
-            "created_at INTEGER NOT NULL, " +
-            "updated_at INTEGER, " +
-            "expires_at INTEGER, " +
             "PRIMARY KEY (z, x, y))";
-
-    private static final String SQL_CREATE_INDEX =
-            "CREATE INDEX IF NOT EXISTS idx_expires ON tiles(expires_at)";
-
-    /** Default tile expiry: 30 days in seconds */
-    private static final long DEFAULT_EXPIRY_SECONDS = 30L * 24 * 60 * 60;
 
     /** Connection pool: cache file path -> connection */
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
@@ -152,41 +168,12 @@ public class TileCache {
     }
 
     /**
-     * Check if a tile is expired based on its expires_at field.
+     * Store a tile in the cache. Tries the minimal-schema insert first
+     * (new caches). If it fails because the existing table requires the
+     * legacy NOT NULL columns (extension, created_at, updated_at), falls
+     * back to the legacy insert. Either way the tile lands.
      *
-     * @return true if expired or not found, false if still valid
-     */
-    public boolean isExpired(String cacheFile, int z, int x, int y) {
-        if (cacheFile == null || cacheFile.isEmpty()) return true;
-
-        try {
-            Connection conn = getConnection(cacheFile);
-            if (conn == null) return true;
-
-            PreparedStatement stmt = conn.prepareStatement(SQL_GET_TILE);
-            stmt.setInt(1, z);
-            stmt.setInt(2, x);
-            stmt.setInt(3, y);
-
-            ResultSet rs = stmt.executeQuery();
-            if (rs.next()) {
-                rs.getBytes(1); // skip data
-                long expiresAt = rs.getLong(2);
-                rs.close();
-                stmt.close();
-                if (expiresAt == 0) return false; // no expiry set
-                return System.currentTimeMillis() / 1000 > expiresAt;
-            }
-            rs.close();
-            stmt.close();
-        } catch (Exception e) {
-            // treat errors as expired
-        }
-        return true;
-    }
-
-    /**
-     * Store a tile in the cache.
+     * No expiration metadata is written. Tiles live forever in the cache.
      *
      * @param cacheFile the .db filename
      * @param z         zoom level
@@ -198,23 +185,31 @@ public class TileCache {
         if (cacheFile == null || cacheFile.isEmpty()) return;
         if (pngData == null || pngData.length == 0) return;
 
-        try {
-            Connection conn = getConnection(cacheFile);
-            if (conn == null) return;
+        Connection conn = getConnection(cacheFile);
+        if (conn == null) return;
 
-            long now = System.currentTimeMillis() / 1000;
-            long expiresAt = now + DEFAULT_EXPIRY_SECONDS;
-
-            PreparedStatement stmt = conn.prepareStatement(SQL_PUT_TILE);
+        // Try minimal insert first
+        try (PreparedStatement stmt = conn.prepareStatement(SQL_PUT_TILE_MIN)) {
             stmt.setInt(1, z);
             stmt.setInt(2, x);
             stmt.setInt(3, y);
             stmt.setBytes(4, pngData);
-            stmt.setLong(5, now);       // created_at
-            stmt.setLong(6, now);       // updated_at
-            stmt.setLong(7, expiresAt); // expires_at
             stmt.executeUpdate();
-            stmt.close();
+            return;
+        } catch (Exception minErr) {
+            // Legacy schema has NOT NULL columns the minimal insert skipped.
+            // Fall through to the legacy form below.
+        }
+
+        try (PreparedStatement stmt = conn.prepareStatement(SQL_PUT_TILE_LEGACY)) {
+            long now = System.currentTimeMillis() / 1000;
+            stmt.setInt(1, z);
+            stmt.setInt(2, x);
+            stmt.setInt(3, y);
+            stmt.setBytes(4, pngData);
+            stmt.setLong(5, now);  // created_at
+            stmt.setLong(6, now);  // updated_at
+            stmt.executeUpdate();
         } catch (Exception e) {
             System.err.println("TileCache: error writing " + z + "/" + x + "/" + y +
                     " to " + cacheFile + ": " + e.getMessage());
@@ -267,18 +262,25 @@ public class TileCache {
                 Connection conn = driver.connect("jdbc:sqlite:" + path, new java.util.Properties());
                 conn.setAutoCommit(true);
 
-                // Enable WAL mode for better concurrent read performance
-                Statement pragmaStmt = conn.createStatement();
-                pragmaStmt.execute("PRAGMA journal_mode=WAL");
-                pragmaStmt.execute("PRAGMA synchronous=NORMAL");
-                pragmaStmt.close();
+                // Enable WAL mode for better concurrent read performance.
+                // Best-effort: if the filesystem is read-only the PRAGMA
+                // call may fail or downgrade silently — keep going.
+                try (Statement pragmaStmt = conn.createStatement()) {
+                    pragmaStmt.execute("PRAGMA journal_mode=WAL");
+                    pragmaStmt.execute("PRAGMA synchronous=NORMAL");
+                } catch (SQLException ignore) {
+                    // read-only DB / no write permission — reads still work
+                }
 
-                // Create table if this is a new database
-                if (!dbFile.exists() || dbFile.length() == 0) {
-                    Statement createStmt = conn.createStatement();
+                // Create table if missing. Best-effort and isolated: a
+                // failure here (read-only FS, locked file, anything) MUST
+                // NOT prevent us from returning the open connection. Reads
+                // come first; CREATE TABLE only matters for writes anyway.
+                try (Statement createStmt = conn.createStatement()) {
                     createStmt.execute(SQL_CREATE_TABLE);
-                    createStmt.execute(SQL_CREATE_INDEX);
-                    createStmt.close();
+                } catch (SQLException ignore) {
+                    // Existing DB with a different schema, or read-only.
+                    // Either way, reads via SELECT data still work.
                 }
 
                 return conn;

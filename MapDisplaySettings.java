@@ -43,6 +43,7 @@ public class MapDisplaySettings {
     private boolean grayscale = false;
     private boolean showGrid = false;
     private int gridSpacingMeters = 100;
+    private boolean cacheOnly = false;
     private final File file;
 
     private MapDisplaySettings() {
@@ -74,6 +75,9 @@ public class MapDisplaySettings {
         if (v > 0) { this.gridSpacingMeters = v; save(); }
     }
 
+    public synchronized boolean isCacheOnly() { return cacheOnly; }
+    public synchronized void setCacheOnly(boolean v) { this.cacheOnly = v; save(); }
+
     /**
      * Lookup the grid step from the standard ladder. Returns 0 if the scale
      * isn't in the ladder (caller can fall back to the current setting).
@@ -96,6 +100,8 @@ public class MapDisplaySettings {
                 try { gridSpacingMeters = Integer.parseInt(m.group(1)); }
                 catch (NumberFormatException ignored) { }
             }
+            m = Pattern.compile("\"cacheOnly\"\\s*:\\s*(true|false)").matcher(txt);
+            if (m.find()) cacheOnly = Boolean.parseBoolean(m.group(1));
         } catch (IOException e) {
             System.err.println("MapDisplaySettings.load: " + e.getMessage());
         }
@@ -106,7 +112,8 @@ public class MapDisplaySettings {
             w.write("{\n");
             w.write("  \"grayscale\": " + grayscale + ",\n");
             w.write("  \"showGrid\": " + showGrid + ",\n");
-            w.write("  \"gridSpacingMeters\": " + gridSpacingMeters + "\n");
+            w.write("  \"gridSpacingMeters\": " + gridSpacingMeters + ",\n");
+            w.write("  \"cacheOnly\": " + cacheOnly + "\n");
             w.write("}\n");
         } catch (IOException e) {
             System.err.println("MapDisplaySettings.save: " + e.getMessage());

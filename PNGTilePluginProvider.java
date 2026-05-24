@@ -65,6 +65,7 @@ public class PNGTilePluginProvider extends Provider {
         items.add(new TracksSettingsMenuAction());
         items.add(new GrayscaleToggleMenuAction());
         items.add(new ShowGridToggleMenuAction());
+        items.add(new CacheOnlyToggleMenuAction());
         for (int scale : SCALE_LADDER) {
             items.add(new SnapScaleMenuAction(scale));
         }
@@ -239,6 +240,51 @@ public class PNGTilePluginProvider extends Provider {
         private void refreshLabelRaw() {
             boolean on = MapDisplaySettings.getInstance().isShowGrid();
             putValue(NAME, on ? "Show Grid  [On]" : "Show Grid  [Off]");
+        }
+    }
+
+    /**
+     * Toggles cache-only mode for tile fetching. When ON, the plugin skips
+     * the online fetch entirely on cache miss — tiles either come from
+     * the local SQLite cache or show as "TILE NOT IN CACHE" placeholders.
+     * Critical for known-offline SAR operations where waiting on dead
+     * network timeouts would slow every paint to a crawl.
+     */
+    private static class CacheOnlyToggleMenuAction extends AbstractMenuAction {
+
+        private volatile boolean inAction = false;
+
+        CacheOnlyToggleMenuAction() {
+            super("CacheOnly", LIAISONOS_MENU);
+            putValue(LOCALIZED_MENU_HIERARCHY, LIAISONOS_MENU);
+            refreshLabelRaw();
+        }
+
+        @Override
+        public void actionPerformed(Object e) {
+            if (inAction) return;
+            inAction = true;
+            try {
+                MapDisplaySettings ds = MapDisplaySettings.getInstance();
+                boolean next = !ds.isCacheOnly();
+                ds.setCacheOnly(next);
+                refreshLabelRaw();
+
+                PNGTileLayer tile = PNGTileLayerCreator.getLastCreatedLayer();
+                if (tile != null) {
+                    tile.clearMemoryCache();
+                    tile.repaint();
+                }
+            } catch (Exception ex) {
+                System.err.println("CacheOnlyToggleMenuAction: " + ex.getMessage());
+            } finally {
+                inAction = false;
+            }
+        }
+
+        private void refreshLabelRaw() {
+            boolean on = MapDisplaySettings.getInstance().isCacheOnly();
+            putValue(NAME, on ? "Cache Only  [On]" : "Cache Only  [Off]");
         }
     }
 
